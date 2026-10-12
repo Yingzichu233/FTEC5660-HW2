@@ -68,6 +68,67 @@ async def load_mcp_tools() -> list[Any]:
     return await client.get_tools()
 
 
+SYSTEM_PROMPT = """You are a meticulous KYC verification agent. You verify one CV (résume) \
+against the candidate's real LinkedIn and Facebook profiles, which you can \
+only access through the provided tools. Never trust the CV itself and never \
+use outside knowledge; every fact must come from a tool call.
+
+Follow this workflow:
+
+1. EXTRACT from the CV: full name, current city, every job (company, title, \
+seniority, start year, end year), every education entry (degree, school, \
+field, graduation year), and every listed skill.
+
+2. IDENTIFY the candidate on LinkedIn with search_linkedin_people. Names are \
+shared by hundreds of people and search returns at most 20 matches in no \
+particular order, so narrow the search with the location parameter (city or \
+country from the CV) and, on LinkedIn, the industry parameter when the CV \
+gives one. If several people still match, disambiguate using the CV's city, \
+employers or schools, and if needed use the fuzzy search option or search by \
+company/school. Call get_linkedin_profile on the best-matching person to get \
+the full profile. If you are unsure the profile belongs to the same person, \
+cross-check with Facebook (search_facebook_users, then get_facebook_profile); \
+note that a Facebook display_name may be a nickname that differs from the \
+legal name, so use the Facebook original_name (not display_name) when \
+comparing names. The real candidate's Facebook and LinkedIn always agree. \
+If no plausible profile exists after several search attempts, treat the CV \
+as fabricated.
+
+3. COMPARE, field by field, ONLY these fields: name, city, jobs (company, \
+title, seniority, start year, end year), education (degree, school, field, \
+graduation year), and skills.
+
+These are NOT discrepancies (do not penalize them):
+- Wording or formatting variants of the same fact, e.g. "Bachelor of \
+Science" vs BSc, "UI/UX Design" vs UI/UX, "The Chinese University of Hong \
+Kong" vs CUHK.
+- Seniority expressed in the title instead of a field, e.g. the CV says \
+"Senior Engineer" while the profile says title Engineer with seniority \
+senior — that MATCHES. But "Senior Analyst" vs title Analyst with \
+seniority junior is a discrepancy.
+- The CV listing FEWER jobs, degrees, or skills than the profile.
+- Job descriptions, the profile headline, and the hometown — never compare \
+these, they are never the source of a discrepancy.
+
+These ARE discrepancies (any single one makes the CV unreliable):
+- Inflated job title or seniority.
+- Shifted employment or graduation years, even by one year (e.g. CV says a \
+job started in 2015 but LinkedIn says 2014).
+- An upgraded degree (e.g. CV says MSc, profile says BSc), a wrong field of \
+study, a fake/wrong school or employer, a wrong city.
+- A skill listed on the CV that does not appear in the profile's skills.
+
+4. SCORE: if every comparable claim matches the profile, the CV is valid. \
+If at least one real discrepancy exists, it is unreliable.
+
+Reply with 1-3 short sentences naming the evidence you checked and any \
+discrepancy found, then on the final line output exactly:
+SCORE: <number>
+where <number> is one value in [0, 1]: use 0.9 when the CV is fully \
+consistent, and 0.1 when you found at least one discrepancy or could not \
+find the candidate at all. The final line must contain no other text."""
+
+
 def build_agent(tools: list[Any]) -> Any:
     """Create and return your agent once.
 
@@ -82,8 +143,41 @@ def build_agent(tools: list[Any]) -> Any:
     Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
     from .env.
     """
-    ### YOUR CODE HERE
-    _ = tools
+    from langchain.agents import create_agent
+    from langchain_deepseek import ChatDeepSeek
+
+    model = ChatDeepSeek(model=MODEL_NAME, temperature=0, max_tokens=4096)
+    return create_agent(model, tools=tools, system_prompt=SYSTEM_PROMPT)
+
+
+_USER_TEMPLATE = """Verify the following CV against the candidate's LinkedIn and Facebook \
+profiles using the tools. Check every job, education entry, skill, the name \
+and the city, then give your final verdict.
+
+----- CV TEXT -----
+{cv_text}
+----- END CV -----"""
+
+
+_SCORE_TAG_RE = re.compile(r"SCORE\s*[:=]?\s*(0(?:\.\d+)?|1(?:\.0+)?)", re.IGNORECASE)
+_ANY_NUM_RE = re.compile(r"(?<![\d.])(0(?:\.\d+)?|1(?:\.0+)?)(?![\d.])")
+
+
+def _extract_score(content: Any) -> float | None:
+    """Pull the agent's final score out of its reply text."""
+    if isinstance(content, list):
+        text = " ".join(
+            str(block.get("text", "")) if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    else:
+        text = str(content)
+    for pattern in (_SCORE_TAG_RE, _ANY_NUM_RE):
+        matches = pattern.findall(text)
+        if matches:
+            score = float(matches[-1])
+            if 0.0 <= score <= 1.0:
+                return score
     return None
 
 
@@ -105,9 +199,36 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     about 3 CVs in flight (e.g. with ``asyncio.Semaphore(3)``): the MCP server is
     shared by the whole class.
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: None for name in cvs}
+    semaphore = asyncio.Semaphore(3)
+    fallback_score = 0.5
+
+    async def verify_one(name: str, text: str) -> tuple[str, float]:
+        async with semaphore:
+            for attempt in range(6):
+                try:
+                    result = await asyncio.wait_for(
+                        agent.ainvoke(
+                            {"messages": [("user", _USER_TEMPLATE.format(cv_text=text))]},
+                            config={"recursion_limit": 50},
+                        ),
+                        timeout=600,
+                    )
+                    score = _extract_score(result["messages"][-1].content)
+                    if score is not None:
+                        return name, score
+                    print(f"[{name}] attempt {attempt + 1}: no score in reply")
+                except Exception as exc:  # noqa: BLE001 - never crash the whole run
+                    detail = exc
+                    while getattr(detail, "exceptions", None):
+                        detail = detail.exceptions[0]
+                    cause = getattr(detail, "__cause__", None) or detail
+                    print(f"[{name}] attempt {attempt + 1} failed: {type(cause).__name__}: {cause}")
+                await asyncio.sleep(min(2 ** attempt, 30))
+            print(f"[{name}] all attempts failed, returning fallback score")
+            return name, fallback_score
+
+    pairs = await asyncio.gather(*(verify_one(name, text) for name, text in cvs.items()))
+    return dict(pairs)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
